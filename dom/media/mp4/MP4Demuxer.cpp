@@ -442,13 +442,6 @@ MP4TrackDemuxer::GetNextSample() {
         case H264::FrameType::I_FRAME_OTHER:
         case H264::FrameType::OTHER: {
           bool keyframe = type == H264::FrameType::I_FRAME_IDR;
-#ifndef MOZ_APPLEMEDIA
-          // The Apple VideoToolbox H.264 decoder could return a bad data error
-          // if a non-IDR I-frame is provided as the first sample to the decoder
-          // after seeking. Therefore, only IDR frames should be marked as key
-          // frames.
-          keyframe = keyframe || type == H264::FrameType::I_FRAME_OTHER;
-#endif
           if (sample->mKeyframe != keyframe) {
             NS_WARNING(nsPrintfCString("Frame incorrectly marked as %skeyframe "
                                        "@ pts:%" PRId64 " dur:%" PRId64
@@ -476,7 +469,6 @@ MP4TrackDemuxer::GetNextSample() {
           break;
       }
     } else if (mType == kHEVC && !sample->mCrypto.IsEncrypted()) {
-#ifdef MOZ_APPLEMEDIA
       // VideoToolbox can return a bad data error if a CRA frame is the first
       // sample after a seek. Only IDR_W_RADL/IDR_N_LP are safe starting points.
       auto isIDR = H265::IsKeyFrame(sample);
@@ -491,7 +483,6 @@ MP4TrackDemuxer::GetNextSample() {
                        .get());
         sample->mKeyframe = keyframe;
       }
-#endif
     } else if (mType == kVP9 && !sample->mCrypto.IsEncrypted()) {
       bool keyframe = VPXDecoder::IsKeyframe(
           Span<const uint8_t>(sample->Data(), sample->Size()),
