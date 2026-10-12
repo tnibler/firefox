@@ -1,0 +1,128 @@
+<!DOCTYPE HTML>
+<html>
+<head>
+  <title>Test seeking between keyframes with missing stss</title>
+  <script src="/tests/SimpleTest/SimpleTest.js"></script>
+  <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css" />
+  <script type="text/javascript" src="manifest.js"></script>
+  <script type="text/javascript" src="seek_support.js.js"></script>
+</head>
+<body>
+<script class="testbody" type="text/javascript">
+
+const IS_ANDROID = navigator.userAgent.includes("Android")
+
+// Tests that the correct frame is displayed after seeking
+// before the first, after the last and between keyframes.
+function doTest(filePath, codecStr) {
+  return async () => {
+    info("Running with file " + filePath)
+    const v = document.createElement('video');
+    if (!v.canPlayType(`video/mp4; codecs="${codecStr}, mp4a.40.2"`)) {
+      ok(true, "Skipping unsupported codec " + codecStr);
+      return;
+    }
+    v.src = filePath;
+    const { promise: errorPromise, resolve: resolveError } = Promise.withResolvers();
+    let notSupported = false;
+    v.addEventListener("error", (e) => {
+      if (e.target.error.code == e.target.error.MEDIA_ERR_DECODE) {
+        notSupported = true;
+        resolveError();
+      } else {
+        ok(false, "should not throw any errors: " + e.message)
+      }
+    });
+
+    await Promise.race([once(v, 'loadeddata'), errorPromise]);
+    if (notSupported) {
+      ok(true, "Skipping unsupported codec " + codecStr);
+      return;
+    }
+
+    const canvas = document.createElement("canvas");
+    document.body.appendChild(v);
+    document.body.appendChild(canvas);
+    canvas.width = v.videoWidth;
+    canvas.height = v.videoHeight;
+
+    const colors = [
+      { time: 3.15, color: [0xff, 0xff, 0x00] },
+      // First PTS is 0.02, so 0.0 is before the first frame
+      { time: 0.0, color: [0x00, 0x00, 0xff] },
+      { time: 2.1, color: [0xff, 0x00, 0x00] },
+      { time: 0.05, color: [0x00, 0x00, 0xff] },
+      { time: 1.1, color: [0x00, 0xff, 0x00] },
+      { time: 0.1, color: [0x00, 0x00, 0xff] },
+
+      { time: 3.9, color: [0xff, 0xff, 0x00] },
+      { time: 2.9, color: [0xff, 0x00, 0x00] },
+      { time: 1.9, color: [0x00, 0xff, 0x00] },
+      { time: 0.9, color: [0x00, 0x00, 0xff] },
+      // Past the end
+      { time: 8.0, color: [0xff, 0xff, 0x00] },
+    ];
+
+    const ctx = canvas.getContext("2d");
+
+    // Bug 2081479
+    // On some Mac OS platforms we get values in [16-235] from getImageData,
+    // not [0-255] for full range. Whatever the cause, it's not the point of
+    // this test, so just adjust expected values.
+    let colorRangeWorkaround = false;
+    if (navigator.platform.includes('Mac')) {
+      v.play();
+      await once(v, 'playing');
+      v.pause();
+      await once(v, 'pause');
+      ctx.drawImage(v, 0, 0);
+      // the frame is solid 0x0000ff
+      const actual = ctx.getImageData(1, 1, 1, 1).data;
+      const thresh = [9, 9, 242];
+      if (actual[0] >= thresh[0] || actual[1] >= thresh[1] || actual[2] <= thresh[2]) {
+        info("Enabling MacOS color range workaround hack");
+        colorRangeWorkaround = true;
+      }
+    }
+
+    for (const { time, color } of colors) {
+      v.currentTime = time;
+      await once(v, 'seeked');
+      v.play();
+      await once(v, 'playing');
+      v.pause();
+      await once(v, 'pause');
+
+      // When seeking past the end, expect to loop around
+      const expectedTime = Math.min(time, 4.0);
+      isfuzzy(v.currentTime, expectedTime, 0.1, 'must seek to correct time');
+
+      // drawImage with video not supported on Android (bug 1526207)
+      if (!IS_ANDROID) {
+        ctx.drawImage(v, 0, 0);
+        let actual = ctx.getImageData(1, 1, 1, 1).data;
+        is(actual[3], 255, 'alpha must be 1.0');
+        for (let i = 0; i < 3; i += 1) {
+          if (colorRangeWorkaround) {
+            actual = actual.map(x => {
+              if (x < 25) { return 0; }
+              if (x > 230) { return 255; }
+              return x;
+            });
+          }
+          isfuzzy(actual[i], color[i], 4, 'wrong frame displayed (seeked to ' + time + ')');
+        }
+      }
+    }
+    document.body.removeChild(v);
+    document.body.removeChild(canvas);
+  }
+}
+
+add_task(doTest("no-stss-4-keyframes/h264.mp4", "avc1.64000d"))
+add_task(doTest("no-stss-4-keyframes/h265.mp4", "hvc1.1.6.L63.B0"))
+add_task(doTest("no-stss-4-keyframes/av1.mp4", "av01.0.00M.08"))
+add_task(doTest("no-stss-4-keyframes/vp9.mp4", "vp09.00.20.08"))
+</script>
+</body>
+</html>

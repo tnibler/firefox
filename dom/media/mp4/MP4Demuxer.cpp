@@ -374,46 +374,67 @@ void MP4TrackDemuxer::EnsureUpToDateIndex() {
 
 RefPtr<MP4TrackDemuxer::SeekPromise> MP4TrackDemuxer::Seek(
     const TimeUnit& aTime) {
-  auto seekTime = aTime;
   mQueuedSample = nullptr;
+  mIterator->Seek(aTime);
 
-  mIterator->Seek(seekTime);
-
-  bool hasSeenValidSamples = false, seekingFromFirstSyncSample = false;
-  // Check what time we actually seeked to.
+  Maybe<TimeUnit> closestTime;
+  bool seekingFromFirstSyncSample = false;
   do {
     auto next = GetNextSample();
     if (next.isErr()) {
       auto error = next.unwrapErr();
-      // If we reached EOS without finding an IDR I-frame we retry from the
-      // first sync sample in the stss, which is always an IDR.
-      if ((mType == kH264 || mType == kHEVC) &&
-          error == NS_ERROR_DOM_MEDIA_END_OF_STREAM && hasSeenValidSamples &&
-          !seekingFromFirstSyncSample) {
-        LOG("Can not find a key frame from the closet sync sample, try again "
-            "from the first sync sample");
-        seekingFromFirstSyncSample = true;
-        mIterator->Seek(seekTime, SampleIterator::SyncSampleMode::First);
-        continue;
+      if (seekingFromFirstSyncSample && closestTime.isSome() &&
+          error == NS_ERROR_DOM_MEDIA_END_OF_STREAM) {
+        // Hit EOS, but have a suitable keyframe at closestTime
+        mIterator->Seek(closestTime.value());
+        mQueuedSample = GetNextSample().unwrap();
+        break;
+      } else {
+        // If we reached EOS without finding an IDR I-frame we retry from the
+        // first sync sample in the stss, which has to be an IDR.
+        // This is the only place where we rely on the stss to be sensible.
+        // We deal with marked sync samples that aren't actually keyframes,
+        // but don't support an stss that's missing the first keyframe.
+        if (error == NS_ERROR_DOM_MEDIA_END_OF_STREAM &&
+            !seekingFromFirstSyncSample) {
+          seekingFromFirstSyncSample = true;
+          mIterator->Seek(aTime, SampleIterator::SyncSampleMode::First);
+          continue;
+        }
+        return SeekPromise::CreateAndReject(error, __func__);
       }
-      return SeekPromise::CreateAndReject(error, __func__);
     }
     RefPtr<MediaRawData> sample = next.unwrap();
-    if (!sample->Size()) {
+    if (!sample->Size() || !sample->mKeyframe) {
       // This sample can't be decoded, continue searching.
       continue;
     }
-    if (sample->mKeyframe) {
-      MOZ_DIAGNOSTIC_ASSERT(sample->HasValidTime());
+
+    if (sample->mTime == aTime ||
+        (!seekingFromFirstSyncSample && sample->mTime < aTime)) {
       mQueuedSample = sample;
-      seekTime = mQueuedSample->mTime;
+      break;
     }
-    hasSeenValidSamples = true;
+    if (closestTime.isNothing()) {
+      closestTime = Some(sample->mTime);
+      continue;
+    }
+
+    const auto oldT = closestTime.value();
+    const auto newT = sample->mTime;
+    // If both are before the target, the later one is closer.
+    // Otherwise the earlier keyframe is preferred.
+    if (oldT < aTime && newT < aTime && oldT < newT) {
+      closestTime = Some(sample->mTime);
+    } else if (newT < oldT) {
+      closestTime = Some(sample->mTime);
+    }
   } while (!mQueuedSample);
+  MOZ_ASSERT_DEBUG_OR_FUZZING(mQueuedSample);
 
   SetNextKeyFrameTime();
 
-  return SeekPromise::CreateAndResolve(seekTime, __func__);
+  return SeekPromise::CreateAndResolve(mQueuedSample->mTime, __func__);
 }
 
 Result<already_AddRefed<MediaRawData>, MediaResult>

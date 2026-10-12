@@ -527,6 +527,15 @@ support-files = [
   "no-stss-1-keyframe/h265.mp4^headers^",
   "no-stss-1-keyframe/vp9.mp4",
   "no-stss-1-keyframe/vp9.mp4^headers^",
+  # generated with no-stss-4-keyframes/generate.sh
+  "no-stss-4-keyframes/av1.mp4",
+  "no-stss-4-keyframes/av1.mp4^headers^",
+  "no-stss-4-keyframes/h264.mp4",
+  "no-stss-4-keyframes/h264.mp4^headers^",
+  "no-stss-4-keyframes/h265.mp4",
+  "no-stss-4-keyframes/h265.mp4^headers^",
+  "no-stss-4-keyframes/vp9.mp4",
+  "no-stss-4-keyframes/vp9.mp4^headers^",
   "notags.mp3",
   "notags.mp3^headers^",
   "opus-mapping2.mp4",
@@ -788,6 +797,8 @@ tags = "seektonextframe"
 ["test_seek_negative.html"]
 
 ["test_seek_nokeyframes.html"]
+
+["test_seek_between_keyframes.html"]
 
 ["test_seek_nosrc.html"]
 
