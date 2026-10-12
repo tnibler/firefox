@@ -4,12 +4,15 @@
 
 #include "AOMDecoder.h"
 #include "BufferMediaResource.h"
+#include "BufferStream.h"
 #include "DecoderData.h"
 #include "H265.h"
 #include "MP4Demuxer.h"
 #include "MP4Metadata.h"
 #include "MediaDataDemuxer.h"
 #include "MockMediaResource.h"
+#include "ResourceStream.h"
+#include "SampleIterator.h"
 #include "VideoUtils.h"
 #include "gtest/gtest.h"
 #include "mozilla/MozPromise.h"
@@ -1221,4 +1224,136 @@ TEST(MP4Demuxer, VideoInfoNclxUnrecognisedCICP)
   EXPECT_EQ(info.mColorPrimaries, Nothing());
   EXPECT_EQ(info.mColorSpace, Nothing());
   EXPECT_EQ(info.mColorRange, gfx::ColorRange::LIMITED);
+}
+
+class RecordReadsMediaResource : public MockMediaResource {
+ public:
+  explicit RecordReadsMediaResource(const char* aFileName)
+      : MockMediaResource(aFileName) {}
+
+  nsresult ReadAt(int64_t aOffset, char* aBuffer, uint32_t aCount,
+                  uint32_t* aBytes) override {
+    if (aCount) {
+      mMaxReadOffset =
+          std::max(mMaxReadOffset, aOffset + AssertedCast<int64_t>(aCount));
+    }
+    return MockMediaResource::ReadAt(aOffset, aBuffer, aCount, aBytes);
+  }
+  nsresult ReadFromCache(char* aBuffer, int64_t aOffset,
+                         uint32_t aCount) override {
+    if (aCount) {
+      mMaxReadOffset =
+          std::max(mMaxReadOffset, aOffset + AssertedCast<int64_t>(aCount));
+    }
+    return MockMediaResource::ReadFromCache(aBuffer, aOffset, aCount);
+  }
+
+  int64_t mMaxReadOffset = -1;
+};
+
+// Parsing and seeking to 0s (with first PTS being >0s) should only read
+// required ranges, not the entire file. The moov is at the beginning of the
+// file, so we expect to only read up to the first sample which ends around 6kB.
+// Generated with:
+//   ffmpeg -f lavfi -i testsrc=r=25:s=320x240:duration=3
+//     -output_ts_offset 0.1 -movflags +faststart -c:v libx264 out.mp4
+TEST(MP4Demuxer, SeekBeforeFirstKeyframe)
+{
+  RefPtr<RecordReadsMediaResource> resource =
+      new RecordReadsMediaResource("nonzero_first_pts.mp4");
+  ASSERT_NS_SUCCEEDED(resource->Open());
+  // recheck this test if the file ever changes to be safe
+  ASSERT_EQ(resource->GetLength(), 17698u);
+
+  RefPtr<MP4DemuxerBinding> binding = new MP4DemuxerBinding(resource);
+  binding->RunTestAndWait([binding, resource]() {
+    binding->mVideoTrack =
+        binding->mDemuxer->GetTrackDemuxer(TrackInfo::kVideoTrack, 0);
+    EXPECT_NE(binding->mVideoTrack, nullptr);
+    binding->mVideoTrack->Seek(media::TimeUnit::Zero());
+    EXPECT_GT(resource->mMaxReadOffset, 0);
+    EXPECT_LT(resource->mMaxReadOffset, 6000);
+    binding->mTaskQueue->BeginShutdown();
+  });
+}
+
+// Seeking past the last sample should resolve to the last sample.
+TEST(MP4Demuxer, SeekPastLastSample)
+{
+  RefPtr<MockMediaResource> resource =
+      new MockMediaResource("nonzero_first_pts.mp4");
+  ASSERT_NS_SUCCEEDED(resource->Open());
+  RefPtr<ByteStream> stream = new ResourceStream(resource);
+
+  const int64_t tb = 100;
+  Mp4parseIndice indices[] = {
+      {100, 200, 0, 100, 0, true},
+      {200, 300, 100, 200, 100, true},
+      {300, 400, 200, 300, 200, true},
+  };
+  Mp4parseByteData data{3, nullptr, indices};
+  for (bool isAudio : {false, true}) {
+    SCOPED_TRACE(isAudio);
+    RefPtr<MP4SampleIndex> index =
+        new MP4SampleIndex(IndiceWrapper(data), stream, 1, isAudio, tb);
+    SampleIterator iterator(index);
+
+    RefPtr<MediaRawData> rawData = iterator.GetNextHeader();
+    ASSERT_NE(rawData, nullptr);
+    EXPECT_EQ(rawData->mTime, TimeUnit(0, tb));
+    iterator.Seek(TimeUnit(1000000, tb));
+    rawData = iterator.GetNextHeader();
+    ASSERT_NE(rawData, nullptr);
+    EXPECT_EQ(rawData->mTime, TimeUnit(200, tb));
+  }
+}
+
+// Fragmented mp4 with B-frames, so that the max PTS in a fragment doesn't
+// coincide with the last sample in decode order. MP4SampleIndex/KeyframeMap
+// should correctly locate samples under these conditions.
+// Generated with:
+//   ffmpeg -f lavfi -i sine=frequency=262:sample_rate=48000:duration=3 -c:a aac
+//   -f lavfi -i testsrc=r=25:s=320x240:duration=3 -g 24
+//   -movflags empty_moov+frag_keyframe -c:v libx264
+//   -x264-params b-pyramid=normal -preset veryslow -bf 10 frag_bframes.mp4
+TEST(MP4SampleIndex, FragBFramesMarkKeyframes)
+{
+  RefPtr<MockMediaResource> resource =
+      new MockMediaResource("frag_bframes.mp4");
+  ASSERT_NS_SUCCEEDED(resource->Open());
+  ASSERT_EQ(resource->GetLength(), 51799u);
+  resource->MockAddBufferedRange(0, resource->GetLength());
+
+  RefPtr<ByteStream> stream = new ResourceStream(resource);
+  MP4Metadata::ResultAndByteBuffer initData = MP4Metadata::Metadata(stream);
+  ASSERT_TRUE(initData.Ref());
+  RefPtr<BufferStream> bufferstream = new BufferStream(initData.Ref());
+  MP4Metadata metadata{bufferstream};
+  ASSERT_NS_SUCCEEDED(metadata.Parse());
+
+  MP4Metadata::ResultAndTrackInfo info =
+      metadata.GetTrackInfo(TrackInfo::kVideoTrack, 0);
+  ASSERT_TRUE(info.Ref());
+  MP4Metadata::ResultAndIndice indices =
+      metadata.GetTrackIndice(info.Ref()->mTrackId);
+  ASSERT_TRUE(indices.Ref());
+  ASSERT_EQ(indices.Ref()->Length(), 0u);
+
+  RefPtr<MP4SampleIndex> index =
+      new MP4SampleIndex(IndiceWrapper(*indices.Ref().get()), stream,
+                         info.Ref()->mTrackId, false, info.Ref()->mTimeScale);
+  ASSERT_TRUE(index->IsFragmented());
+  MediaByteRangeSet ranges;
+  ASSERT_NS_SUCCEEDED(resource->GetCachedRanges(ranges));
+  index->UpdateMoofIndex(ranges);
+
+  SampleIterator iterator(index);
+  iterator.Seek(TimeUnit::Zero());
+  int nSamples = 0;
+  while (RefPtr<MediaRawData> data = iterator.GetNextHeader()) {
+    iterator.ConfirmCurrentIsKeyframe(true);
+    EXPECT_EQ(index->IsKeyframe(data->mTime), Some(true));
+    ++nSamples;
+  }
+  EXPECT_EQ(nSamples, 75);
 }

@@ -5,6 +5,8 @@
 #ifndef DOM_MEDIA_MP4_SAMPLE_ITERATOR_H_
 #define DOM_MEDIA_MP4_SAMPLE_ITERATOR_H_
 
+#include <map>
+
 #include "ByteStream.h"
 #include "MP4Interval.h"
 #include "MediaData.h"
@@ -37,6 +39,10 @@ class SampleIterator {
             SyncSampleMode aMode = SyncSampleMode::Closest);
 
   media::TimeUnit GetNextKeyframeTime();
+  // Save definitive result of codec based keyframe analysis for the sample
+  // returned by the last call to `GetNext`.
+  // `GetNext` must have been called before calling this.
+  void ConfirmCurrentIsKeyframe(bool aIsKeyframe);
 
  private:
   Result<Sample*, nsresult> Get();
@@ -59,6 +65,52 @@ class SampleIterator {
   friend class MP4SampleIndex;
   size_t mCurrentMoof;
   size_t mCurrentSample;
+};
+
+DDLoggedTypeDeclName(KeyframeMap);
+
+class KeyframeMap : public DecoderDoctorLifeLogger<KeyframeMap> {
+ public:
+  typedef media::Interval<media::TimeUnit> Interval;
+
+  // Source of keyframe information. `Container` means stss or sample flags,
+  // `Codec` means keyframes are confirmed by codec-specific packet analysis.
+  // When marking keyframes, `Codec` overrides `Container` information.
+  MOZ_DEFINE_ENUM_CLASS_WITH_TOSTRING_AT_CLASS_SCOPE(KeyframeInfo,
+                                                     (Container, Codec));
+
+  struct KeyframeLocation {
+    size_t mMoof;
+    size_t mIndex;
+    bool operator==(const KeyframeLocation& other) const = default;
+  };
+
+  struct Entry {
+    Interval mCompositionRange;
+    KeyframeLocation mLocation;
+    KeyframeInfo mSource;
+    bool operator==(const Entry& other) const = default;
+  };
+
+  void MarkKeyframe(const Interval& aCompositionRange,
+                    KeyframeLocation aLocation, KeyframeInfo aSource);
+  void MarkNotKeyframe(const Interval& aCompositionRange, KeyframeInfo aSource);
+  void Clear();
+  // Get last keyframe up to and including a timestamp.
+  Maybe<Entry> GetNearestUpTo(const media::TimeUnit& aTime) const;
+  // Get first keyframe at or after a timestamp.
+  Maybe<Entry> GetNextAfter(const media::TimeUnit& aTime) const;
+  Maybe<Entry> GetFirst() const;
+  Maybe<Entry> Get(const media::TimeUnit& aTime) const;
+  // Whether the codec level keyframe analysis been done at this timestamp.
+  bool HaveChecked(const media::TimeUnit& aTime) const {
+    return mCheckedIntervals.Contains(aTime);
+  };
+
+ private:
+  std::map<media::TimeUnit, Entry> mMap;
+  // Time ranges where keyframe info is definitive
+  media::IntervalSet<media::TimeUnit> mCheckedIntervals;
 };
 
 class MP4SampleIndex {
@@ -117,6 +169,13 @@ class MP4SampleIndex {
   uint64_t GetEvictionOffset(const media::TimeUnit& aTime);
   bool IsFragmented() { return !!mMoofParser; }
 
+  // Return result of codec based keyframe analysis, if it exists.
+  Maybe<bool> IsKeyframe(const media::TimeUnit& aTime) const;
+  Maybe<media::TimeUnit> GetNearestKeyframeUpTo(
+      const media::TimeUnit& aTime) const;
+  Maybe<media::TimeUnit> GetNextKeyframeAfter(
+      const media::TimeUnit& aTime) const;
+
   friend class SampleIterator;
 
  private:
@@ -134,6 +193,7 @@ class MP4SampleIndex {
   mozilla::MediaByteRangeSet mLastCachedRanges;
   mozilla::media::TimeIntervals mLastBufferedRanges;
   bool mIsAudio;
+  KeyframeMap mKeyframeMap;
 };
 }  // namespace mozilla
 
