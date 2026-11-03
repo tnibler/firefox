@@ -29,6 +29,10 @@
   DDMOZ_LOG_FMT(gMediaDemuxerLog, mozilla::LogLevel::Debug, "::{}: " arg, \
                 __func__, ##__VA_ARGS__)
 
+#define LOGV(arg, ...)                                                      \
+  DDMOZ_LOG_FMT(gMediaDemuxerLog, mozilla::LogLevel::Verbose, "::{}: " arg, \
+                __func__, ##__VA_ARGS__)
+
 namespace mozilla {
 
 using TimeUnit = media::TimeUnit;
@@ -62,7 +66,12 @@ class MP4TrackDemuxer : public MediaTrackDemuxer,
   void NotifyDataArrived();
 
  private:
-  Result<already_AddRefed<MediaRawData>, MediaResult> GetNextSample();
+  // Read sample from mIterator and do codec-specific keyframe check if
+  // required.
+  // If aKeyframeFlagWasWrong is not null, the out param indicates whether the
+  // check changed the keyframe flag.
+  Result<already_AddRefed<MediaRawData>, MediaResult> GetNextSample(
+      bool* aKeyframeFlagWasWrong = nullptr);
   void EnsureUpToDateIndex();
   void SetNextKeyFrameTime();
   RefPtr<MediaResource> mResource;
@@ -375,6 +384,7 @@ void MP4TrackDemuxer::EnsureUpToDateIndex() {
 
 RefPtr<MP4TrackDemuxer::SeekPromise> MP4TrackDemuxer::Seek(
     const TimeUnit& aTime) {
+  LOGV("Seek to {}", aTime.ToString());
   mQueuedSample = nullptr;
   // If stss entries are accurate, mIterator will correctly seek to the last
   // usable keyframe before the target time. Otherwise, falsely marked
@@ -385,19 +395,23 @@ RefPtr<MP4TrackDemuxer::SeekPromise> MP4TrackDemuxer::Seek(
 
   Maybe<TimeUnit> seekTime;
   Maybe<TimeUnit> currClosestTime;
-  bool seekingFromFirstSyncSample = false;
+  // If seeking has to jump backwards, check all samples up to the next keyframe
+  // at or after the target time to ensure the seek resolves to the closest
+  // keyframe.
+  bool doExhaustiveScan = false;
   do {
-    auto next = GetNextSample();
+    bool oldKeyframeInfoWasWrong = false;
+    auto next = GetNextSample(&oldKeyframeInfoWasWrong);
     if (next.isErr()) {
       auto error = next.unwrapErr();
       if (error == nsresult::NS_ERROR_DOM_MEDIA_END_OF_STREAM) {
-        if (!seekingFromFirstSyncSample) {
+        if (!doExhaustiveScan) {
           // If we reached EOS without finding an IDR I-frame we retry from the
           // first sync sample.
           LOG("Can not find a key frame from the closest sync sample, try "
               "again from the first sync sample");
-          seekingFromFirstSyncSample = true;
-          mIterator->Seek(aTime, SampleIterator::SyncSampleMode::First);
+          doExhaustiveScan = true;
+          mIterator->Seek(aTime);
           continue;
         } else if (currClosestTime.isSome()) {
           LOG("Hit End of Stream again, use saved sample");
@@ -407,15 +421,32 @@ RefPtr<MP4TrackDemuxer::SeekPromise> MP4TrackDemuxer::Seek(
       }
       return SeekPromise::CreateAndReject(error, __func__);
     }
-
     RefPtr<MediaRawData> sample = next.unwrap();
+
+    if (oldKeyframeInfoWasWrong) {
+      LOG("Keyframe info for {} was wrong, enable exhaustive scan",
+          sample->mTime.ToString());
+      doExhaustiveScan = true;
+      if (!sample->mKeyframe) {
+        // Keyframe map lookup gave a false positive, try again from the
+        // keyframe before it. The loop will jump backwards until a real
+        // keyframe is found, then walk to the first keyframe past the target
+        // time in case there is an unmarked keyframe closer to the target time.
+        // The number of times this branch can be taken is bounded, as falsely
+        // marked keyframes won't be seeked to again. Every iteration removes
+        // one potential false positive.
+        LOGV("Retry seek with updated keyframe info");
+        mIterator->Seek(aTime);
+        continue;
+      }
+    }
     if (!sample->Size() || !sample->mKeyframe) {
       // This sample can't be decoded, continue searching.
       continue;
     }
     // Common happy path, mIterator->Seek found the correct keyframe
-    const bool foundIt = sample->mTime == aTime ||
-                         (sample->mTime < aTime && !seekingFromFirstSyncSample);
+    const bool foundIt =
+        sample->mTime == aTime || (sample->mTime < aTime && !doExhaustiveScan);
     // Target is before the first keyframe, so accept the next best after it
     const bool noEarlierKf = aTime < sample->mTime &&
                              mIndex->GetNearestKeyframeUpTo(aTime).isNothing();
@@ -423,6 +454,7 @@ RefPtr<MP4TrackDemuxer::SeekPromise> MP4TrackDemuxer::Seek(
       mQueuedSample = sample;
       break;
     }
+
     if (currClosestTime.isNothing()) {
       currClosestTime = Some(sample->mTime);
       continue;
@@ -465,7 +497,7 @@ RefPtr<MP4TrackDemuxer::SeekPromise> MP4TrackDemuxer::Seek(
 }
 
 Result<already_AddRefed<MediaRawData>, MediaResult>
-MP4TrackDemuxer::GetNextSample() {
+MP4TrackDemuxer::GetNextSample(bool* aKeyframeFlagWasWrong) {
   auto next = mIterator->GetNext();
   if (next.isErr()) {
     return next;
@@ -474,10 +506,14 @@ MP4TrackDemuxer::GetNextSample() {
 
   if (mInfo->GetAsVideoInfo()) {
     sample->mExtraData = mInfo->GetAsVideoInfo()->mExtraData;
-    if (const auto isKeyframe = mIndex->IsKeyframe(sample->mTime);
-        isKeyframe.isSome()) {
-      sample->mKeyframe = isKeyframe.value();
+    if (const auto knownKeyframe = mIndex->IsKeyframe(sample->mTime);
+        knownKeyframe.isSome()) {
+      sample->mKeyframe = knownKeyframe.value();
+      if (aKeyframeFlagWasWrong) {
+        *aKeyframeFlagWasWrong = false;
+      }
     } else {
+      const bool oldIsKeyframe = sample->mKeyframe;
       if (mType == kH264 && !sample->mCrypto.IsEncrypted()) {
         H264::FrameType type = H264::GetFrameType(sample);
         switch (type) {
@@ -586,6 +622,9 @@ MP4TrackDemuxer::GetNextSample() {
                          .get());
           sample->mKeyframe = keyframe;
         }
+      }
+      if (aKeyframeFlagWasWrong) {
+        *aKeyframeFlagWasWrong = sample->mKeyframe != oldIsKeyframe;
       }
       mIterator->ConfirmCurrentIsKeyframe(sample->mKeyframe);
     }
@@ -703,7 +742,7 @@ void MP4TrackDemuxer::Reset() {
   mQueuedSample = nullptr;
   // TODO: verify this
   mNextKeyframeTime.reset();
-  mIterator->Seek(TimeUnit::Zero(), SampleIterator::SyncSampleMode::First);
+  mIterator->Seek(TimeUnit::FromNegativeInfinity());
   SetNextKeyFrameTime();
 }
 
@@ -720,45 +759,45 @@ nsresult MP4TrackDemuxer::GetNextRandomAccessPoint(TimeUnit* aTime) {
 RefPtr<MP4TrackDemuxer::SkipAccessPointPromise>
 MP4TrackDemuxer::SkipToNextRandomAccessPoint(const TimeUnit& aTimeThreshold) {
   mQueuedSample = nullptr;
-  bool doRetry = false;
-  if (auto nextTime = mIndex->GetNextKeyframeAfter(aTimeThreshold);
-      nextTime.isSome()) {
-    mIterator->Seek(nextTime.value());
-    // retrying only makes sense if we potentially skipped keyframes by jumping
-    // ahead.
-    doRetry = true;
-  }
-  // Loop until we reach the next keyframe after the threshold.
-  uint32_t parsed = 0;
+  uint32_t skipped = 0;
   Maybe<SkipFailureHolder> failure;
-  bool retryingFromFirstSyncSample = false;
-  while (true) {
-    auto next = GetNextSample();
+  SampleIterator savedIterator(*mIterator);
+  SampleLocation oldPos = mIterator->CurrentPosition();
+
+  // Skip to the next keyframe according to current information.
+  // If there isn't one, fall back to plain search.
+  mIterator->TrySkipToNextKeyframe(aTimeThreshold);
+  do {
+    bool oldKeyframeInfoWasWrong = false;
+    auto next = GetNextSample(&oldKeyframeInfoWasWrong);
     if (next.isErr()) {
       auto error = next.unwrapErr();
-      if (error == NS_ERROR_DOM_MEDIA_END_OF_STREAM &&
-          !retryingFromFirstSyncSample && doRetry) {
-        LOG("Hit end of stream, retrying from first sync sample");
-        retryingFromFirstSyncSample = true;
-        mIterator->Seek(aTimeThreshold, SampleIterator::SyncSampleMode::First);
-        continue;
-      }
-      failure.emplace(error, parsed);
+      failure.emplace(error, skipped);
       break;
     }
+    SampleLocation newPos = mIterator->CurrentPosition();
+    skipped = AssertedCast<uint32_t>(mIndex->NumSamplesBetween(oldPos, newPos));
     RefPtr<MediaRawData> sample = next.unwrap();
-    parsed++;
     MOZ_DIAGNOSTIC_ASSERT(sample->HasValidTime());
-    if (sample->mKeyframe && sample->mTime >= aTimeThreshold) {
-      mQueuedSample = sample;
-      break;
+    if (!sample->mKeyframe && oldKeyframeInfoWasWrong) {
+      // Keyframe map lookup gave a false positive, try again.
+      LOGV("Retry skip with updated keyframe info");
+      *mIterator = savedIterator;
+      mIterator->TrySkipToNextKeyframe(aTimeThreshold);
+      continue;
     }
-  }
+    if (!sample->mKeyframe || sample->mTime < aTimeThreshold) {
+      continue;
+    }
+    mQueuedSample = sample;
+  } while (!mQueuedSample);
+  MOZ_ASSERT_DEBUG_OR_FUZZING(mQueuedSample || failure);
+
   SetNextKeyFrameTime();
   if (failure.isSome()) {
     return SkipAccessPointPromise::CreateAndReject(failure.extract(), __func__);
   }
-  return SkipAccessPointPromise::CreateAndResolve(parsed, __func__);
+  return SkipAccessPointPromise::CreateAndResolve(skipped, __func__);
 }
 
 TimeIntervals MP4TrackDemuxer::GetBuffered() {

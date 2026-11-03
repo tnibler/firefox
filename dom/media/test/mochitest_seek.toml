@@ -536,17 +536,22 @@ support-files = [
   "no-stss-4-keyframes/h265.mp4^headers^",
   "no-stss-4-keyframes/vp9.mp4",
   "no-stss-4-keyframes/vp9.mp4^headers^",
-  # generated with bad-stss-2-keyframes/generate.sh
+  # generated with bad-stss/generate.sh
   # 1st stss entry points to non-IDR (=first keyframe not listed)
-  "bad-stss-2-keyframes/h264-1.mp4",
-  "bad-stss-2-keyframes/h264-1.mp4^headers^",
+  "bad-stss/stss-1st-wrong-h264.mp4",
+  "bad-stss/stss-1st-wrong-h264.mp4^headers^",
+  "bad-stss/stss-1st-wrong-h265.mp4",
+  "bad-stss/stss-1st-wrong-h265.mp4^headers^",
   # 2nd stss entry points to non-IDR
-  "bad-stss-2-keyframes/h264-2.mp4",
-  "bad-stss-2-keyframes/h264-2.mp4^headers^",
-  "bad-stss-2-keyframes/h265-1.mp4",
-  "bad-stss-2-keyframes/h265-1.mp4^headers^",
-  "bad-stss-2-keyframes/h265-2.mp4",
-  "bad-stss-2-keyframes/h265-2.mp4^headers^",
+  "bad-stss/stss-2nd-wrong-h264.mp4",
+  "bad-stss/stss-2nd-wrong-h264.mp4^headers^",
+  "bad-stss/stss-2nd-wrong-h265.mp4",
+  "bad-stss/stss-2nd-wrong-h265.mp4^headers^",
+  # 2 non-IDR stss entries between the first 2 IDR frames
+  "bad-stss/stss-extra-entries-h264.mp4",
+  "bad-stss/stss-extra-entries-h264.mp4^headers^",
+  "bad-stss/stss-extra-entries-h265.mp4",
+  "bad-stss/stss-extra-entries-h265.mp4^headers^",
   "notags.mp3",
   "notags.mp3^headers^",
   "opus-mapping2.mp4",

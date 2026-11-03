@@ -10,16 +10,10 @@
 <body>
 <script class="testbody" type="text/javascript">
 
-function expectedColor(time) {
-  if (time < 1.0) { return [0x00, 0x00, 0xff]; }
-  if (time < 2.0) { return [0x00, 0xff, 0x00]; }
-  if (time < 3.0) { return [0xff, 0x00, 0x00]; }
-  return [0xff, 0xff, 0x00];
-}
 
 // Tests that the correct frame is displayed after seeking
 // before the first, after the last and between keyframes.
-function doTest(filePath, codecStr, seekTimes) {
+function doTest(filePath, codecStr, seekTimes, clampTime, expectedColor) {
   return async () => {
     info("Running with file " + filePath)
     const v = document.createElement('video');
@@ -87,7 +81,7 @@ function doTest(filePath, codecStr, seekTimes) {
           await once(v, 'seeked');
         }
 
-        const expectedTime = Math.min(time, 4.0);
+        const expectedTime = Math.min(time, clampTime);
         isfuzzy(v.currentTime, expectedTime, 0.1, 'must seek to correct time');
 
         ctx.drawImage(v, 0, 0);
@@ -111,6 +105,12 @@ function doTest(filePath, codecStr, seekTimes) {
   }
 }
 
+function expectedColor1(time) {
+  if (time < 1.0) { return [0x00, 0x00, 0xff]; }
+  if (time < 2.0) { return [0x00, 0xff, 0x00]; }
+  if (time < 3.0) { return [0xff, 0x00, 0x00]; }
+  return [0xff, 0xff, 0x00];
+}
 const seekTimes = [
   3.15,
   0.0, // First PTS is 0.02, so 0.0 is before the first frame
@@ -127,31 +127,53 @@ const seekTimes = [
   3.22,
   1.08,
 ];
+const duration1 = 4.0;
 
 // Missing stss
-add_task(doTest("no-stss-4-keyframes/h264.mp4", "avc1.64000d", seekTimes));
-add_task(doTest("no-stss-4-keyframes/h265.mp4", "hvc1.1.6.L63.B0", seekTimes));
-add_task(doTest("no-stss-4-keyframes/av1.mp4", "av01.0.00M.08", seekTimes));
-add_task(doTest("no-stss-4-keyframes/vp9.mp4", "vp09.00.20.08", seekTimes));
+add_task(doTest("no-stss-4-keyframes/h264.mp4", "avc1.64000d", seekTimes, duration1, expectedColor1));
+add_task(doTest("no-stss-4-keyframes/h265.mp4", "hvc1.1.6.L63.B0", seekTimes, duration1, expectedColor1));
+add_task(doTest("no-stss-4-keyframes/av1.mp4", "av01.0.00M.08", seekTimes, duration1, expectedColor1));
+add_task(doTest("no-stss-4-keyframes/vp9.mp4", "vp09.00.20.08", seekTimes, duration1, expectedColor1));
 
 // stss exists, but doesn't contain the second keyframe but instead
 // a non-IDR I-frame.
-add_task(doTest("bad-stss-2-keyframes/h264-2.mp4", "avc1.64000d", seekTimes));
-add_task(doTest("bad-stss-2-keyframes/h265-2.mp4", "hvc1.1.6.L63.B0", seekTimes));
+add_task(doTest("bad-stss/stss-2nd-wrong-h264.mp4", "avc1.64000d", seekTimes, duration1, expectedColor1));
+add_task(doTest("bad-stss/stss-2nd-wrong-h265.mp4", "hvc1.1.6.L63.B0", seekTimes, duration1, expectedColor1));
 
 // stss exists but lists a non-IDR I-frame instead of the first IDR.
-// Samples before the first stss entry are not read, so playback and seeking
-// only work after 2s
-const seekTimesAfter2ndIDR = [
+add_task(doTest("bad-stss/stss-1st-wrong-h264.mp4", "avc1.64000d", seekTimes, duration1, expectedColor1));
+add_task(doTest("bad-stss/stss-1st-wrong-h265.mp4", "hvc1.1.6.L63.B0", seekTimes, duration1, expectedColor1));
+
+function expectedColor2(time) {
+  if (time < 0.5) { return [0x00, 0x00, 0xff]; }
+  if (time < 1.0) { return [0x00, 0xff, 0x00]; }
+  if (time < 3.0) { return [0xff, 0x00, 0x00]; }
+  return [0xff, 0xff, 0x00];
+}
+const seekTimes2 = [
   3.15,
+  0.0, // First PTS is 0.02, so 0.0 is before the first frame
   2.1,
+  0.05,
+  1.1,
+  0.1,
   3.9,
-  2.9,
+  5.9,
+  1.9,
+  0.9,
   8.0, // Past the end
+  0.0,
   3.22,
+  0.0,
+  6.8,
+  1.08,
 ];
-add_task(doTest("bad-stss-2-keyframes/h264-1.mp4", "avc1.64000d", seekTimesAfter2ndIDR));
-add_task(doTest("bad-stss-2-keyframes/h265-1.mp4", "hvc1.1.6.L63.B0", seekTimesAfter2ndIDR));
+const duration2 = 7.0;
+
+// stss is complete with 2 additional non-IDR stss entries
+add_task(doTest("bad-stss/stss-extra-entries-h264.mp4", "avc1.64000d", seekTimes2, duration2, expectedColor2));
+add_task(doTest("bad-stss/stss-extra-entries-h265.mp4", "hvc1.1.6.L63.B0", seekTimes2, duration2, expectedColor2));
+
 </script>
 </body>
 </html>

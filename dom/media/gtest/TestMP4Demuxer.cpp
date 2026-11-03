@@ -1236,6 +1236,7 @@ class RecordReadsMediaResource : public MockMediaResource {
     if (aCount) {
       mMaxReadOffset =
           std::max(mMaxReadOffset, aOffset + AssertedCast<int64_t>(aCount));
+      mReadAccesses.push_back(aOffset + aCount);
     }
     return MockMediaResource::ReadAt(aOffset, aBuffer, aCount, aBytes);
   }
@@ -1244,10 +1245,12 @@ class RecordReadsMediaResource : public MockMediaResource {
     if (aCount) {
       mMaxReadOffset =
           std::max(mMaxReadOffset, aOffset + AssertedCast<int64_t>(aCount));
+      mReadAccesses.push_back(aOffset + aCount);
     }
     return MockMediaResource::ReadFromCache(aBuffer, aOffset, aCount);
   }
 
+  std::vector<int64_t> mReadAccesses;
   int64_t mMaxReadOffset = -1;
 };
 
@@ -1256,26 +1259,160 @@ class RecordReadsMediaResource : public MockMediaResource {
 // file, so we expect to only read up to the first sample which ends around 6kB.
 // Generated with:
 //   ffmpeg -f lavfi -i testsrc=r=25:s=320x240:duration=3
-//     -output_ts_offset 0.1 -movflags +faststart -c:v libx264 out.mp4
+//     -output_ts_offset 0.1 -use_editlist 0 -movflags +faststart -c:v libx264
+//     out.mp4
 TEST(MP4Demuxer, SeekBeforeFirstKeyframe)
 {
   RefPtr<RecordReadsMediaResource> resource =
       new RecordReadsMediaResource("nonzero_first_pts.mp4");
   ASSERT_NS_SUCCEEDED(resource->Open());
   // recheck this test if the file ever changes to be safe
-  ASSERT_EQ(resource->GetLength(), 17698u);
+  ASSERT_EQ(resource->GetLength(), 17650u);
 
   RefPtr<MP4DemuxerBinding> binding = new MP4DemuxerBinding(resource);
   binding->RunTestAndWait([binding, resource]() {
     binding->mVideoTrack =
         binding->mDemuxer->GetTrackDemuxer(TrackInfo::kVideoTrack, 0);
-    EXPECT_NE(binding->mVideoTrack, nullptr);
-    binding->mVideoTrack->Seek(media::TimeUnit::Zero());
-    EXPECT_GT(resource->mMaxReadOffset, 0);
-    EXPECT_LT(resource->mMaxReadOffset, 6000);
-    binding->mTaskQueue->BeginShutdown();
+    ASSERT_NE(binding->mVideoTrack, nullptr);
+    binding->mVideoTrack->Seek(TimeUnit::Zero())
+        ->Then(
+            binding->mTaskQueue, __func__,
+            [binding, resource](TimeUnit aActualTime) {
+              EXPECT_EQ(aActualTime, TimeUnit(1024, 12800))
+                  << "Seeked to " << aActualTime.ToString();
+              EXPECT_GT(resource->mMaxReadOffset, 0);
+              EXPECT_LT(resource->mMaxReadOffset, 6000);
+              binding->mTaskQueue->BeginShutdown();
+            },
+            [binding](const MediaResult&) {
+              EXPECT_TRUE(false) << "Seek failed";
+              binding->mTaskQueue->BeginShutdown();
+            });
   });
 }
+
+struct SeekTestCase {
+  const char* testName;
+  const char* fileName;
+  int64_t fileSize;
+  // Time to seek to
+  TimeUnit targetTime;
+  // Time at which seek should resolve
+  TimeUnit actualTime;
+
+  // first seek to targetTime should read in this range
+  int64_t minOffset1;
+  int64_t maxOffset1;
+
+  // second seek to targetTime should read in this range
+  int64_t minOffset2;
+  int64_t maxOffset2;
+};
+
+static constexpr SeekTestCase seekTestCases[]{
+    // Seeking before the first sample PTS should not read past that sample
+    {"NonZeroFirstPTS", "nonzero_first_pts.mp4", 17650, TimeUnit::Zero(),
+     TimeUnit(1024, 12800), 1714, 5363, 1714, 5363},
+    // dom/media/test/bad-stss/stss-2nd-wrong.mp4
+    // has 2 IDR and 2 stss entries, but the second one lists a non-IDR at 3s
+    // instead of the IDR at 2s.
+    // Seeking to 3.5s should resolve to the IDR at 2s after searching up to the
+    // next keyframe. In this case that means reading until EOS and restarting
+    // from the beginning. The demuxer will save the IDR at 0s, later replacing
+    // it with the better one at 2s and finally yield that.
+    // The second seek to 3.5s should immediately jump to the 2s IDR and not
+    // read past it.
+    {"Stss2ndWrongH264", "stss-2nd-wrong-h264.mp4", 42076, TimeUnit(3500, 1000),
+     TimeUnit(26560, 12800), 40970, 40984, 23069, 23535},
+    {"Stss2ndWrongH265", "stss-2nd-wrong-h265.mp4", 45018, TimeUnit(3500, 1000),
+     TimeUnit(26560, 12800), 43898, 43926, 24439, 25865},
+
+    // dom/media/test/bad-stss/stss-1st-wrong.mp4
+    // has 2 stss entries, but the first keyframe is replaced with a non-IDR.
+    // The second stss entry at 2s is correct, so seeking >2s should not do
+    // anything unusual.
+    {"Stss1stWrongH264Seek3500", "stss-1st-wrong-h264.mp4", 42076,
+     TimeUnit(3500, 1000), TimeUnit(26560, 12800), 23069, 23535, 23069, 23535},
+    {"Stss1stWrongH265Seek3500", "stss-1st-wrong-h265.mp4", 45018,
+     TimeUnit(3500, 1000), TimeUnit(26560, 12800), 24439, 25865, 24439, 25865},
+
+    // Seeking before the first keyframe listed in the stss will scan from the
+    // first sample and should only read up to the next keyframe after the
+    // target.
+    {"Stss1stWrongH264Seek1000", "stss-1st-wrong-h264.mp4", 42076,
+     TimeUnit(1000, 1000), TimeUnit(960, 12800), 4525, 23535, 4525, 5495},
+    {"Stss1stWrongH265Seek1000", "stss-1st-wrong-h265.mp4", 45018,
+     TimeUnit(1000, 1000), TimeUnit(960, 12800), 6925, 25865, 6925, 7264},
+    // Same should apply when seeking to before the first sample
+    {"Stss1stWrongH264SeekZero", "stss-1st-wrong-h264.mp4", 42076,
+     TimeUnit(0, 1000), TimeUnit(960, 12800), 4525, 23535, 4525, 5495},
+    {"Stss1stWrongH265SeekZero", "stss-1st-wrong-h265.mp4", 45018,
+     TimeUnit(0, 1000), TimeUnit(960, 12800), 6925, 25865, 6925, 7264},
+
+    // dom/media/test/bad-stss/stss-extra-entries-h264.mp4
+    // has 3 IDR at 0s, 3s, 6s and 2 non-IDR at 0.5s, 1s.
+    // The stss incorrectly contains the non-IDR I-frames.
+    // The first seek to 1.5s will reject the 1s I-frame, try again at 0.5s and
+    // reject that too, finally accepting the IDR at 0s. The demuxer will scan
+    // up to the first IDR past the target at 3s and resolve to 0s.
+    // The second seek should immediately resolve to 0s and not read past it.
+    {"StssExtraEntriesH264", "stss-extra-entries-h264.mp4", 71528,
+     TimeUnit(1500, 1000), TimeUnit(960, 12800), 34518, 34933, 6801, 7771},
+    {"StssExtraEntriesH265", "stss-extra-entries-h265.mp4", 75342,
+     TimeUnit(1500, 1000), TimeUnit(960, 12800), 37162, 37569, 9236, 9535}};
+
+class SeekReadRangeTest : public testing::TestWithParam<SeekTestCase> {};
+
+TEST_P(SeekReadRangeTest, BadStssReadsOnlyRequiredRanges) {
+  const SeekTestCase test = GetParam();
+  RefPtr<RecordReadsMediaResource> resource =
+      new RecordReadsMediaResource(test.fileName);
+  ASSERT_NS_SUCCEEDED(resource->Open());
+  // Sample offsets manually set using mp4dump, so the files should not change.
+  ASSERT_EQ(resource->GetLength(), test.fileSize);
+
+  RefPtr<MP4DemuxerBinding> binding = new MP4DemuxerBinding(resource);
+  binding->RunTestAndWait([=]() {
+    binding->mVideoTrack =
+        binding->mDemuxer->GetTrackDemuxer(TrackInfo::kVideoTrack, 0);
+    ASSERT_NE(binding->mVideoTrack, nullptr);
+    binding->mVideoTrack->Seek(test.targetTime)
+        ->Then(
+            binding->mTaskQueue, __func__,
+            [=](TimeUnit aActualTime) {
+              EXPECT_EQ(aActualTime, test.actualTime)
+                  << "Seeked to " << aActualTime.ToString();
+              EXPECT_GE(resource->mMaxReadOffset, test.minOffset1);
+              EXPECT_LE(resource->mMaxReadOffset, test.maxOffset1);
+
+              binding->mVideoTrack->Reset();
+              resource->mMaxReadOffset = -1;
+              binding->mVideoTrack->Seek(test.targetTime)
+                  ->Then(
+                      binding->mTaskQueue, __func__,
+                      [=](TimeUnit aActualTime) {
+                        EXPECT_EQ(aActualTime, test.actualTime)
+                            << "Seeked to " << aActualTime.ToString();
+                        EXPECT_GE(resource->mMaxReadOffset, test.minOffset2);
+                        EXPECT_LE(resource->mMaxReadOffset, test.maxOffset2);
+                        binding->mTaskQueue->BeginShutdown();
+                      },
+                      [binding](const MediaResult&) {
+                        EXPECT_TRUE(false) << "2nd seek failed";
+                        binding->mTaskQueue->BeginShutdown();
+                      });
+            },
+            [binding](const MediaResult&) {
+              EXPECT_TRUE(false) << "1st seek failed";
+              binding->mTaskQueue->BeginShutdown();
+            });
+  });
+}
+
+INSTANTIATE_TEST_SUITE_P(MP4Demuxer, SeekReadRangeTest,
+                         testing::ValuesIn(seekTestCases), [](const auto& t) {
+                           return std::string(t.param.testName);
+                         });
 
 // Seeking past the last sample should resolve to the last sample.
 TEST(MP4Demuxer, SeekPastLastSample)
@@ -1307,6 +1444,193 @@ TEST(MP4Demuxer, SeekPastLastSample)
     EXPECT_EQ(rawData->mTime, TimeUnit(200, tb));
   }
 }
+
+struct SkipToRAPTestCase {
+  const char* testName;
+  const char* fileName;
+  bool expectSuccess;
+  // Consume this many samples before skipping to next keyframe.
+  size_t initialGetSamples;
+  // Last sample before skipping should have this timestamp.
+  TimeUnit lastSampleTime;
+  TimeUnit threshTime;
+  TimeUnit targetTime;
+  uint32_t nSkipped;
+};
+
+static constexpr SkipToRAPTestCase skipRAPTestCases[] = {
+    // KF1 < track position < thresh < KF2
+    {"Stss1stWrongH264Ok1", "stss-1st-wrong-h264.mp4", true, 1,
+     TimeUnit(960, 12800), TimeUnit(1500, 1000), TimeUnit(26560, 12800), 50},
+    {"Stss1stWrongH265Ok1", "stss-1st-wrong-h265.mp4", true, 1,
+     TimeUnit(960, 12800), TimeUnit(1500, 1000), TimeUnit(26560, 12800), 50},
+
+    // KF1 < thresh < track position < KF2
+    {"Stss1stWrongH264Ok2", "stss-1st-wrong-h264.mp4", true, 30,
+     TimeUnit(15296, 12800), TimeUnit(1100, 1000), TimeUnit(26560, 12800), 21},
+    {"Stss1stWrongH265Ok2", "stss-1st-wrong-h265.mp4", true, 30,
+     TimeUnit(16320, 12800), TimeUnit(1100, 1000), TimeUnit(26560, 12800), 21},
+
+    // thresh < KF1 < current track position < KF2, should yield KF2
+    {"Stss1stWrongH264Ok3", "stss-1st-wrong-h264.mp4", true, 40,
+     TimeUnit(20928, 12800), TimeUnit(300, 1000), TimeUnit(26560, 12800), 11},
+    {"Stss1stWrongH265Ok3", "stss-1st-wrong-h265.mp4", true, 40,
+     TimeUnit(20928, 12800), TimeUnit(300, 1000), TimeUnit(26560, 12800), 11},
+
+    // KF1 < track position < thresh < KF2
+    {"Stss2ndWrongH264Ok1", "stss-2nd-wrong-h264.mp4", true, 30,
+     TimeUnit(15296, 12800), TimeUnit(1500, 1000), TimeUnit(26560, 12800), 21},
+
+    // KF1 < thresh < track position < KF2
+    {"Stss2ndWrongH264Ok2", "stss-2nd-wrong-h264.mp4", true, 45,
+     TimeUnit(22464, 12800), TimeUnit(1500, 1000), TimeUnit(26560, 12800), 6},
+
+    // KF1 < thresh < track position = KF2
+    {"Stss2ndWrongH264Ok3", "stss-2nd-wrong-h264.mp4", true, 50,
+     TimeUnit(25536, 12800), TimeUnit(400, 1000), TimeUnit(26560, 12800), 1},
+
+    // thresh < KF1 < current track position < KF2, should yield KF2
+    {"Stss2ndWrongH264Ok4", "stss-2nd-wrong-h264.mp4", true, 40,
+     TimeUnit(20928, 12800), TimeUnit(300, 1000), TimeUnit(26560, 12800), 11},
+
+    {"StssExtraEntriesH264Ok1", "stss-extra-entries-h264.mp4", true, 1,
+     TimeUnit(960, 12800), TimeUnit(1500, 1000), TimeUnit(39360, 12800), 75},
+    {"StssExtraEntriesH264Ok2", "stss-extra-entries-h264.mp4", true, 1,
+     TimeUnit(960, 12800), TimeUnit(50, 1000), TimeUnit(39360, 12800), 75},
+    {"StssExtraEntriesH264Ok3", "stss-extra-entries-h264.mp4", true, 20,
+     TimeUnit(9664, 12800), TimeUnit(77760, 12800), TimeUnit(77760, 12800),
+     131},
+    {"StssExtraEntriesH264Ok4", "stss-extra-entries-h264.mp4", true, 20,
+     TimeUnit(9664, 12800), TimeUnit(3100, 1000), TimeUnit(77760, 12800), 131},
+
+    {"FragBFramesOk1", "frag_bframes.mp4", true, 1, TimeUnit(1024, 12800),
+     TimeUnit(1600, 1000), TimeUnit(25600, 12800), 48},
+    // next sample is in next moof
+    {"FragBFramesOk2", "frag_bframes.mp4", true, 24, TimeUnit(12288, 12800),
+     TimeUnit(100, 1000), TimeUnit(13312, 12800), 1},
+    {"FragBFramesOk3", "frag_bframes.mp4", true, 28, TimeUnit(13824, 12800),
+     TimeUnit(100, 1000), TimeUnit(25600, 12800), 21},
+
+    {"Stss1stWrongH264Fail1", "stss-1st-wrong-h264.mp4", false, 1,
+     TimeUnit(960, 12800), TimeUnit(2500, 1000), TimeUnit(0, 12800), 99},
+
+    {"Stss1stWrongH264Fail2", "stss-1st-wrong-h264.mp4", false, 52,
+     TimeUnit(28608, 12800), TimeUnit(100, 1000), TimeUnit(0, 12800), 48},
+
+    {"Stss2ndWrongH264Fail", "stss-2nd-wrong-h264.mp4", false, 1,
+     TimeUnit(960, 12800), TimeUnit(2500, 1000), TimeUnit(0, 12800), 99},
+
+    {"FragBFramesFail", "frag_bframes.mp4", false, 25, TimeUnit(13312, 12800),
+     TimeUnit(3000, 1000), TimeUnit(0, 12800), 50},
+};
+
+class SkipToNextRAPTest : public testing::TestWithParam<SkipToRAPTestCase> {};
+
+TEST_P(SkipToNextRAPTest, SkipTest) {
+  const SkipToRAPTestCase test = GetParam();
+  RefPtr<RecordReadsMediaResource> resource =
+      new RecordReadsMediaResource(test.fileName);
+  ASSERT_NS_SUCCEEDED(resource->Open());
+
+  const auto doTest = [&test](RefPtr<MP4DemuxerBinding> binding) {
+    binding->mVideoTrack->GetSamples(test.initialGetSamples)
+        ->Then(
+            binding->mTaskQueue, __func__,
+            [binding, &test](RefPtr<MediaTrackDemuxer::SamplesHolder> samples) {
+              const TimeUnit lastSampleTime =
+                  samples->GetSamples().LastElement()->mTime;
+              ASSERT_EQ(samples->GetSamples().Length(), test.initialGetSamples);
+              EXPECT_EQ(lastSampleTime, test.lastSampleTime)
+                  << "Last demuxed sample time " << lastSampleTime.ToString();
+              binding->mVideoTrack->SkipToNextRandomAccessPoint(test.threshTime)
+                  ->Then(
+                      binding->mTaskQueue, __func__,
+                      [binding, &test](uint32_t aSkipped) {
+                        if (!test.expectSuccess) {
+                          EXPECT_TRUE(false) << "SkipToNextRandomAccessPoint "
+                                                "succeeded, wanted fail";
+                          binding->mTaskQueue->BeginShutdown();
+                          return;
+                        }
+                        EXPECT_EQ(aSkipped, test.nSkipped);
+                        binding->mVideoTrack->GetSamples(1)->Then(
+                            binding->mTaskQueue, __func__,
+                            [binding,
+                             &test](RefPtr<MediaTrackDemuxer::SamplesHolder>
+                                        samples) {
+                              ASSERT_EQ(samples->GetSamples().Length(), 1u);
+                              const auto sample = samples->GetSamples()[0];
+                              EXPECT_TRUE(sample->mKeyframe);
+                              EXPECT_EQ(sample->mTime, test.targetTime)
+                                  << "Skipped to sample: "
+                                  << sample->mTime.ToString();
+                              binding->mTaskQueue->BeginShutdown();
+                            },
+                            [binding](const MediaResult&) {
+                              ASSERT_TRUE(false)
+                              << "GetSamples failed";
+                              binding->mTaskQueue->BeginShutdown();
+                            });
+                      },
+                      [binding,
+                       &test](MediaTrackDemuxer::SkipFailureHolder aFailure) {
+                        if (test.expectSuccess) {
+                          EXPECT_TRUE(false)
+                              << "SkipToNextRandomAccessPoint failed";
+                        } else {
+                          EXPECT_EQ(aFailure.mSkipped, test.nSkipped);
+                          binding->mTaskQueue->BeginShutdown();
+                        }
+                      }
+
+                  );
+            },
+            [binding](const MediaResult&) {
+              ASSERT_TRUE(false)
+              << "GetSamples failed";
+              binding->mTaskQueue->BeginShutdown();
+            });
+  };
+  {
+    SCOPED_TRACE("Test with fresh demuxer");
+    RefPtr<MP4DemuxerBinding> binding = new MP4DemuxerBinding(resource);
+    binding->RunTestAndWait([binding, &doTest]() {
+      binding->mVideoTrack =
+          binding->mDemuxer->GetTrackDemuxer(TrackInfo::kVideoTrack, 0);
+      ASSERT_NE(binding->mVideoTrack, nullptr);
+      doTest(binding);
+    });
+  }
+
+  {
+    //  Run test again with a fully populated keyframe map by reading all
+    //  samples first
+    SCOPED_TRACE("Test after consuming all samples");
+    RefPtr<MP4DemuxerBinding> binding = new MP4DemuxerBinding(resource);
+    binding->RunTestAndWait([binding, &doTest]() {
+      binding->mVideoTrack =
+          binding->mDemuxer->GetTrackDemuxer(TrackInfo::kVideoTrack, 0);
+      ASSERT_NE(binding->mVideoTrack, nullptr);
+      binding->mVideoTrack->GetSamples(-1)->Then(
+          binding->mTaskQueue, __func__,
+          [binding, &doTest](RefPtr<MediaTrackDemuxer::SamplesHolder> samples) {
+            binding->mVideoTrack->Reset();
+            doTest(binding);
+          },
+          [binding](const MediaResult&) {
+            ASSERT_TRUE(false)
+            << "GetSamples failed";
+            binding->mTaskQueue->BeginShutdown();
+          });
+    });
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(MP4Demuxer, SkipToNextRAPTest,
+                         testing::ValuesIn(skipRAPTestCases),
+                         [](const auto& t) {
+                           return std::string(t.param.testName);
+                         });
 
 // Fragmented mp4 with B-frames, so that the max PTS in a fragment doesn't
 // coincide with the last sample in decode order. MP4SampleIndex/KeyframeMap
@@ -1348,12 +1672,21 @@ TEST(MP4SampleIndex, FragBFramesMarkKeyframes)
   index->UpdateMoofIndex(ranges);
 
   SampleIterator iterator(index);
+  std::vector<TimeUnit> keyframeTimes;
   iterator.Seek(TimeUnit::Zero());
-  int nSamples = 0;
   while (RefPtr<MediaRawData> data = iterator.GetNextHeader()) {
     iterator.ConfirmCurrentIsKeyframe(true);
     EXPECT_EQ(index->IsKeyframe(data->mTime), Some(true));
-    ++nSamples;
+    keyframeTimes.push_back(data->mTime);
   }
-  EXPECT_EQ(nSamples, 75);
+  EXPECT_EQ(keyframeTimes.size(), 75u);
+  // ConfirmCurrentIsKeyframe works with sample locations (moof, index),
+  // IsKeyframe and Seek find samples by time. Check that these mappings are
+  // correct and the iterator actually yields the correct time after seeking.
+  for (const auto& time : keyframeTimes) {
+    iterator.Seek(time);
+    RefPtr<MediaRawData> next = iterator.GetNextHeader();
+    ASSERT_NE(next, nullptr);
+    EXPECT_EQ(next->mTime, time);
+  }
 }
