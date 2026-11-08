@@ -567,21 +567,47 @@ void SampleIterator::Seek(const TimeUnit& aTime) {
 }
 
 void SampleIterator::TrySkipToNextKeyframe(const TimeUnit& aTimeThreshold) {
+  LOGV("Time threshold: {}", aTimeThreshold.ToString());
   if (!mIndex->mIsAudio) {
-    auto entry = mIndex->mKeyframeMap.GetNextAfter(
-        aTimeThreshold, SampleLocation(mCurrentMoof, mCurrentSample));
-    if (entry) {
-      const auto kfLoc = entry.value().mLocation;
-      mCurrentSample = kfLoc.mSample;
-      mCurrentMoof = kfLoc.mMoof;
-      LOGV("Skip to keyframe at moof {}, sample {}", mCurrentMoof,
-           mCurrentSample);
-      MOZ_ASSERT_DEBUG_OR_FUZZING(!mIndex->mMoofParser ||
-                                  mCurrentMoof <
-                                      mIndex->mMoofParser->Moofs().Length());
-      return;
-    }
+    bool doRetryLookup;
+    do {
+      doRetryLookup = false;
+      auto entry = mIndex->mKeyframeMap.GetNextAfter(
+          aTimeThreshold, SampleLocation(mCurrentMoof, mCurrentSample));
+      if (entry) {
+        mCurrentSample = entry.value().mLocation.mSample;
+        mCurrentMoof = entry.value().mLocation.mMoof;
+        LOGV("Skip to keyframe at moof {}, sample {}", mCurrentMoof,
+             mCurrentSample);
+        MOZ_ASSERT_DEBUG_OR_FUZZING(!mIndex->mMoofParser ||
+                                    mCurrentMoof <
+                                        mIndex->mMoofParser->Moofs().Length());
+        return;
+      } else if (mIndex->mMoofParser) {
+        // If the time threshold falls after the last moof, fetch the next one
+        // and try using the keyframe map again.
+        // This avoids the fallback search for well-formed fragmented files.
+        if (auto lastBefore =
+                mIndex->mKeyframeMap.GetNearestUpTo(aTimeThreshold)) {
+          size_t threshMoof =
+              std::max(mCurrentMoof, lastBefore.value().mLocation.mMoof);
+          if (threshMoof + 1 == mIndex->mMoofParser->Moofs().Length()) {
+            if (NS_SUCCEEDED(mIndex->BlockingReadNextMoof())) {
+              LOGV("Load next moof and retry skip");
+              doRetryLookup = true;
+            }
+          }
+        }
+      } else if (mIndex->HaveCheckedSurroundingKeyframes(aTimeThreshold)) {
+        // We know there is no next keyframe, advance to the end
+        mCurrentSample = mIndex->mIndex.Length();
+        return;
+      }
+    } while (doRetryLookup);
   }
+  // Otherwise fall back to full search, the caller will have to verify
+  // keyframes themselves.
+  LOG("Fall back to exhaustive search");
   while (Sample* sample = Get().unwrapOr(nullptr)) {
     if (sample->mCompositionRange.start >= aTimeThreshold) {
       break;
