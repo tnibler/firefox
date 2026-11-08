@@ -200,8 +200,6 @@ class MP4SampleIndex : public DecoderDoctorLifeLogger<MP4SampleIndex> {
 
   // Return result of codec based keyframe analysis, if it exists.
   Maybe<bool> IsKeyframe(const media::TimeUnit& aTime) const;
-  Maybe<media::TimeUnit> GetNearestKeyframeUpTo(
-      const media::TimeUnit& aTime) const;
   size_t NumSamplesBetween(const SampleLocation& aStart,
                            const SampleLocation& aEnd) const;
   // Whether the nearest keyframe before and after the given time are known with

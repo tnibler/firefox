@@ -932,14 +932,6 @@ Maybe<bool> MP4SampleIndex::IsKeyframe(const TimeUnit& aTime) const {
   return Some(mKeyframeMap.Get(aTime).isSome());
 }
 
-Maybe<TimeUnit> MP4SampleIndex::GetNearestKeyframeUpTo(
-    const TimeUnit& aTime) const {
-  return mKeyframeMap.GetNearestUpTo(aTime).map(
-      [](const KeyframeMap::Entry& entry) {
-        return entry.mCompositionRange.mStart;
-      });
-}
-
 size_t MP4SampleIndex::NumSamplesBetween(const SampleLocation& aStart,
                                          const SampleLocation& aEnd) const {
   MOZ_ASSERT_DEBUG_OR_FUZZING(aStart <= aEnd);
